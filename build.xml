@@ -1,0 +1,3 @@
+<project name="dotCMS URL Map Fixes Plugin" default="build">
+	<import file="../common.xml"/>	
+</project>

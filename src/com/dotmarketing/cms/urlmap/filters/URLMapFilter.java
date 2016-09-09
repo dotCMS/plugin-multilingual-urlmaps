@@ -1,0 +1,470 @@
+/*
+ * WebSessionFilter
+ *
+ * A filter that recognizes return users who have
+ * chosen to have their login information remembered.
+ * Creates a valid WebSession object and
+ * passes it a contact to use to fill its information
+ *
+ */
+package com.dotmarketing.cms.urlmap.filters;
+
+import com.dotmarketing.beans.Host;
+import com.dotmarketing.beans.Identifier;
+import com.dotmarketing.business.APILocator;
+import com.dotmarketing.business.CacheLocator;
+import com.dotmarketing.business.DotCacheException;
+import com.dotmarketing.business.web.HostWebAPI;
+import com.dotmarketing.business.web.UserWebAPI;
+import com.dotmarketing.business.web.WebAPILocator;
+import com.dotmarketing.cache.ContentTypeCacheImpl;
+import com.dotmarketing.cache.FieldsCache;
+import com.dotmarketing.cache.VirtualLinksCache;
+import com.dotmarketing.common.model.ContentletSearch;
+import com.dotmarketing.exception.DotDataException;
+import com.dotmarketing.exception.DotRuntimeException;
+import com.dotmarketing.exception.DotSecurityException;
+import com.dotmarketing.filters.CMSFilter;
+import com.dotmarketing.filters.CmsUrlUtil;
+import com.dotmarketing.portlets.contentlet.business.ContentletAPI;
+import com.dotmarketing.portlets.contentlet.model.Contentlet;
+import com.dotmarketing.portlets.languagesmanager.model.Language;
+import com.dotmarketing.portlets.structure.StructureUtil;
+import com.dotmarketing.portlets.structure.factories.StructureFactory;
+import com.dotmarketing.portlets.structure.model.Field;
+import com.dotmarketing.portlets.structure.model.SimpleStructureURLMap;
+import com.dotmarketing.portlets.structure.model.Structure;
+import com.dotmarketing.util.*;
+import com.liferay.portal.model.User;
+
+import javax.servlet.*;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpSession;
+import java.io.IOException;
+import java.net.URLDecoder;
+import java.util.*;
+
+/**
+ * This filter handles all requests regarding URL Maps. These URL maps on
+ * content structures are used to create friendly URLs for SEO.
+ * 
+ * @author root
+ * @version 1.2
+ * @since 03-22-2012
+ *
+ */
+public class URLMapFilter implements Filter {
+
+	private List<PatternCache> patternsCache = new ArrayList<>();
+	private ContentletAPI conAPI;
+	private UserWebAPI wuserAPI;
+	private HostWebAPI whostAPI;
+	private boolean urlFallthrough;
+	CmsUrlUtil cmsUrlUtil = CmsUrlUtil.getInstance();
+	
+	
+	
+	public void destroy() {
+
+	}
+
+	/**
+	 * Runs the filter validations on the current request.
+	 * 
+	 * @param req
+	 * @param res
+	 * @param chain
+	 */
+	public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) throws IOException,
+			ServletException {
+		
+		
+
+		
+		
+		HttpServletRequest request = (HttpServletRequest) req;
+		HttpSession optSession = request.getSession(false);
+		String uri = request.getRequestURI();
+		uri = URLDecoder.decode(uri, "UTF-8");
+
+		/*
+		 * Getting host object form the session
+		 */
+		Host host;
+		try {
+			host = whostAPI.getCurrentHost(request);
+		} catch (Exception e) {
+			Logger.warn(this, "Unable to retrieve current request host for URI " + uri);
+			throw new ServletException(e.getMessage(), e);
+		}
+
+		// http://jira.dotmarketing.net/browse/DOTCMS-6079
+		if (uri.endsWith("/"))
+			uri = uri.substring(0, uri.length() - 1);
+		
+		String pointer = null;
+		
+		if(host!=null){
+			pointer = VirtualLinksCache.getPathFromCache(host.getHostname() + ":" + uri);
+		}
+		if (!UtilMethods.isSet(pointer)) {
+			pointer = VirtualLinksCache.getPathFromCache(uri);
+		}
+		if(UtilMethods.isSet(pointer)){
+			uri = pointer;
+		}
+
+		long languageId = WebAPILocator.getLanguageWebAPI().getLanguage(request).getId();
+		
+		String mastRegEx = null;
+		StringBuilder query;
+		try {
+			mastRegEx = CacheLocator.getContentTypeCache().getURLMasterPattern();
+		} catch (DotCacheException e2) {
+			Logger.error(URLMapFilter.class, e2.getMessage(), e2);
+		}
+		if (mastRegEx == null || patternsCache.isEmpty()) {
+			synchronized (ContentTypeCacheImpl.MASTER_STRUCTURE) {
+				try {
+					mastRegEx = buildCacheObjects();
+				} catch (DotDataException e) {
+					Logger.error(URLMapFilter.class, e.getMessage(), e);
+					throw new ServletException("Unable to build URLMap patterns", e);
+				}
+			}
+		}
+		boolean trailSlash = uri.endsWith("/");
+		boolean isDotPage = cmsUrlUtil.isPageAsset(uri, host, languageId);
+				
+				
+		String url = (!trailSlash && !isDotPage)?uri+'/':uri;
+		if (!UtilMethods.isSet(mastRegEx) || uri.startsWith("/webdav")) {
+			chain.doFilter(req, res);
+			return;
+		}
+		if (RegEX.contains(url, mastRegEx)) {
+			boolean ADMIN_MODE = (optSession!=null && optSession.getAttribute(com.dotmarketing.util.WebKeys.ADMIN_MODE_SESSION) != null);
+			boolean EDIT_MODE = ((optSession!=null && optSession.getAttribute(com.dotmarketing.util.WebKeys.EDIT_MODE_SESSION) != null) && ADMIN_MODE);
+
+			Structure structure = null;
+			User user = null;
+			try {
+				user = wuserAPI.getLoggedInUser(request);
+			} catch (Exception e1) {
+				Logger.error(URLMapFilter.class, e1.getMessage(), e1);
+			}
+	
+			List<ContentletSearch> cons = null;
+			for (PatternCache pc : patternsCache) {
+				List<RegExMatch> matches = RegEX.findForUrlMap(url, pc.getRegEx());
+				if (matches != null && matches.size() > 0) {
+					query = new StringBuilder();
+					List<RegExMatch> groups = matches.get(0).getGroups();
+					List<String> fieldMatches = pc.getFieldMatches();
+					structure = CacheLocator.getContentTypeCache().getStructureByInode(pc.getStructureInode());
+					List<Field> fields = FieldsCache.getFieldsByStructureInode(structure.getInode());
+					query.append("+structureName:").append(structure.getVelocityVarName()).append(" +deleted:false ");
+					if (EDIT_MODE || ADMIN_MODE) {
+						query.append("+working:true ");
+					} else {
+						query.append("+live:true ");
+					}
+
+					// Set Host Stuff
+					boolean hasHostField = false;
+					Boolean hostIsRequired = false;
+					for (Field field : fields) {
+						if (field.getFieldType().equals(Field.FieldType.HOST_OR_FOLDER.toString())) {
+							hasHostField = true;
+							if (field.isRequired()) {
+								hostIsRequired = true;
+							}
+							break;
+						}
+					}
+					if (hasHostField) {
+						if (host != null) {
+							//if (hostIsRequired) {
+							//query.append("+conhost:" + host.getIdentifier() + " ");
+							//} else {
+							try {
+								query.append("+(conhost:").append(host.getIdentifier()).append(" ")
+								     .append("conhost:").append(whostAPI.findSystemHost(wuserAPI.getSystemUser(), true).getIdentifier()).append(") ");
+							} catch (Exception e) {
+								Logger.error(URLMapFilter.class, e.getMessage()
+										+ " : Unable to build host in query : ", e);
+							}
+							//}
+						}
+					}
+
+					//Different query to search with no mapping if required
+					StringBuilder queryNoMapping = new StringBuilder();
+					queryNoMapping.append(query.toString());
+
+					// build fields
+					int counter = 0;
+					for (RegExMatch regExMatch : groups) {
+						String value = regExMatch.getMatch();
+						if (value.endsWith("/")) {
+							value = value.substring(0, value.length() - 1);
+						}
+						query.append("+").append(structure.getVelocityVarName()).append(".").append(fieldMatches.get(counter)).append(":")
+								.append(value).append(" ");
+						counter++;
+					}
+					
+					try {
+					    long sessionLang=WebAPILocator.getLanguageWebAPI().getLanguage(request).getId();
+					    long defaultLang=APILocator.getLanguageAPI().getDefaultLanguage().getId();
+
+						//Url maps and language_id parameter can cause 404's
+						String languageIdParam = request.getParameter("language_id");
+						if (languageIdParam != null && !languageIdParam.isEmpty()) {
+							//Lets try to find the identifier related to this urlmap
+							cons = conAPI.searchIndex(query.toString(), 1, 0, (hostIsRequired ? "conhost, modDate" : "modDate"), user, true);
+							ContentletSearch c = cons.get(0);
+							/*
+							Now lets do the search using the identifier and not the url map, this in order to avoid
+							404 errors when changing lenguages in url maps
+							 */
+							query = queryNoMapping.append(" +").append("identifier:").append(c.getIdentifier()).append(" ");
+							query.append(" +languageId:").append(sessionLang).append(" ");
+						}
+
+						cons = conAPI.searchIndex(query.toString(), -1, 0, (hostIsRequired ? "conhost, modDate" : "modDate"), user, true);
+
+						//If nothing found lets try with the default language
+						if ((cons == null || cons.isEmpty() )) {
+							if (Config.getBooleanProperty("DEFAULT_CONTENT_TO_DEFAULT_LANGUAGE", false)) {
+								//Lets try to find the identifier related to this urlmap
+								cons = conAPI.searchIndex(query.toString(), 1, 0, (hostIsRequired ? "conhost, modDate" : "modDate"), user, true);
+								ContentletSearch c = cons.get(0);
+								query = queryNoMapping.append(" +").append("identifier:").append(c.getIdentifier()).append(" ");
+								query.append(" +languageId:").append(defaultLang).append(" ");
+
+								cons = conAPI.searchIndex(query.toString(), -1, 0, (hostIsRequired ? "conhost, modDate" : "modDate"), user, true);
+							}
+						}
+
+						int idx = 0;
+
+						//If we found more than one results for the url map (multiple languages with the same url map)
+						if (cons.size() > 1) {
+
+							int i = 0;
+							for (ContentletSearch contentletSearch : cons) {
+								// prefer session setting
+								Contentlet second = conAPI.find(contentletSearch.getInode(), user, true);
+								if (second.getLanguageId() == sessionLang) {
+									idx = i;
+									break;
+								}
+
+								i++;
+							}
+						}
+
+						ContentletSearch c = cons.get(idx);
+						Long languageFound = conAPI.find(c.getInode(), user, true).getLanguageId();
+						if (sessionLang != languageFound) {
+
+							//Search for the language of the url map to display
+							Language currentLang = APILocator.getLanguageAPI().getLanguage(languageFound);
+							Locale locale = new Locale(currentLang.getLanguageCode(), currentLang.getCountryCode());
+
+							request.setAttribute(WebKeys.HTMLPAGE_LANGUAGE, String.valueOf(languageFound));
+							request.setAttribute(WebKeys.LOCALE, locale);
+
+							if (optSession != null) {
+								optSession.setAttribute(WebKeys.HTMLPAGE_LANGUAGE, String.valueOf(languageFound));
+								optSession.setAttribute(WebKeys.LOCALE, locale);
+							}
+
+							if (!ADMIN_MODE || request.getParameter("leftMenu") == null) {
+								if (optSession != null) {
+									optSession.setAttribute(WebKeys.Globals_FRONTEND_LOCALE_KEY, locale);
+								}
+								request.setAttribute(WebKeys.Globals_FRONTEND_LOCALE_KEY, locale);
+							}
+
+						}
+
+						request.setAttribute(WebKeys.WIKI_CONTENTLET, c.getIdentifier());
+						request.setAttribute(WebKeys.WIKI_CONTENTLET_INODE, c.getInode());
+						request.setAttribute(WebKeys.CLICKSTREAM_IDENTIFIER_OVERRIDE, c.getIdentifier());
+						request.setAttribute(WebKeys.WIKI_CONTENTLET_URL, url);
+						String[] x = url.split("/");
+						for(int i=0;i<x.length;i++){
+							if(UtilMethods.isSet(x[i])){
+								request.setAttribute("URL_ARG" + i, x[i]);
+							}
+						}
+						
+						break;
+					} catch (DotDataException e) {
+						Logger.warn(this, "DotDataException", e);
+					} catch (DotSecurityException e) {
+						Logger.warn(this, "DotSecurityException", e);
+					} catch(java.lang.IndexOutOfBoundsException iob){
+						Logger.warn(this, "No urlmap contentlent found uri:" + url + " query:" + query.toString());
+					}catch(Exception e){
+						Logger.warn(this, "No index?" + e.getMessage());
+					}
+				}
+			}
+			
+		
+			if (structure != null && UtilMethods.isSet(structure.getDetailPage())) {
+				Identifier ident;
+				try {
+					ident = APILocator.getIdentifierAPI().find(structure.getDetailPage());
+					if(ident ==null || ! UtilMethods.isSet(ident.getInode())){
+						throw new DotRuntimeException("No valid detail page for structure '" + structure.getName() + "'. Looking for detail page id=" + structure.getDetailPage());
+					}
+
+					
+					if((cons != null && cons.size() > 0) || !urlFallthrough){
+						
+						request.setAttribute(CMSFilter.CMS_FILTER_URI_OVERRIDE, ident.getURI());
+
+					}
+
+				} catch (Exception e) {
+					Logger.error(URLMapFilter.class, e.getMessage(), e);
+				}
+			}
+
+		}
+		chain.doFilter(req, res);
+	}
+
+	public void init(FilterConfig config) throws ServletException {
+		Config.setMyApp(config.getServletContext());
+		conAPI = APILocator.getContentletAPI();
+		wuserAPI = WebAPILocator.getUserWebAPI();
+		whostAPI = WebAPILocator.getHostWebAPI();
+		
+		// persistant on disk cache makes this necessary
+		CacheLocator.getContentTypeCache().clearURLMasterPattern();
+		urlFallthrough = Config.getBooleanProperty("URLMAP_FALLTHROUGH", true);
+	}
+
+	/**
+	 * Builds the list of URL maps and sorts them by the number of slashes in
+	 * the URL (highest to lowest). This method is called only when a new URL 
+	 * map is added, and is marked as <code>synchronized</code> to avoid data 
+	 * inconsistency.
+	 * 
+	 * @return A <code>String</code> containing a Regex, which contains all the
+	 *         URL maps in the system.
+	 * @throws DotDataException
+	 *             An error occurred when retrieving information from the
+	 *             database.
+	 */
+	private synchronized String buildCacheObjects() throws DotDataException {
+		List<SimpleStructureURLMap> urlMaps = StructureFactory.findStructureURLMapPatterns();
+		StringBuilder masterRegEx = new StringBuilder();
+		boolean first = true;
+		patternsCache.clear();
+		for (SimpleStructureURLMap urlMap : urlMaps) {
+			PatternCache pc = new PatternCache();
+			String regEx = StructureUtil.generateRegExForURLMap(urlMap.getURLMapPattern());
+			// if we have an empty string, move on
+			if (!UtilMethods.isSet(regEx) || regEx.trim().length() < 3) {
+				continue;
+
+			}
+			pc.setRegEx(regEx);
+			pc.setStructureInode(urlMap.getInode());
+			pc.setURLpattern(urlMap.getURLMapPattern());
+			List<RegExMatch> fieldMathed = RegEX.find(urlMap.getURLMapPattern(), "{([^{}]+)}");
+			List<String> fields = new ArrayList<String>();
+			for (RegExMatch regExMatch : fieldMathed) {
+				fields.add(regExMatch.getGroups().get(0).getMatch());
+			}
+			pc.setFieldMatches(fields);
+			patternsCache.add(pc);
+			if (!first) {
+				masterRegEx.append("|");
+			}
+			masterRegEx.append(regEx);
+			first = false;
+		}
+		Collections.sort(this.patternsCache, new Comparator<PatternCache>() {
+			public int compare(PatternCache o1, PatternCache o2) {
+				String regex1 = o1.getRegEx();
+				String regex2 = o2.getRegEx();
+				if (!regex1.endsWith("/")) {
+					regex1 += "/";
+				}
+				if (!regex2.endsWith("/")) {
+					regex2 += "/";
+				}
+				int regExLength1 = getSlashCount(regex1);
+				int regExLength2 = getSlashCount(regex2);
+				if (regExLength1 < regExLength2) {
+					return 1;
+				} else if (regExLength1 > regExLength2) {
+					return -1;
+				} else {
+					return 0;
+				}
+			}
+		});
+		CacheLocator.getContentTypeCache().addURLMasterPattern(masterRegEx.toString());
+		return masterRegEx.toString();
+	}
+
+	private class PatternCache {
+		private String regEx;
+		private String structureInode;
+		private String URLpattern;
+		private List<String> fieldMatches;
+
+		public void setRegEx(String regEx) {
+			this.regEx = regEx;
+		}
+
+		public String getRegEx() {
+			return regEx;
+		}
+
+		public void setStructureInode(String structureInode) {
+			this.structureInode = structureInode;
+		}
+
+		public String getStructureInode() {
+			return structureInode;
+		}
+
+		public void setURLpattern(String uRLpattern) {
+			URLpattern = uRLpattern;
+		}
+
+		@SuppressWarnings("unused")
+		public String getURLpattern() {
+			return URLpattern;
+		}
+
+		public void setFieldMatches(List<String> fieldMatches) {
+			this.fieldMatches = fieldMatches;
+		}
+
+		public List<String> getFieldMatches() {
+			return fieldMatches;
+		}
+	}
+	
+	private int getSlashCount(String string){
+		int ret = 0;
+		if(UtilMethods.isSet(string)){
+			for(int i=0;i<string.length();i++){
+				if(string.charAt(i)=='/'){
+					ret+=1;
+				}
+			}
+		}
+		return ret;
+	}
+}
